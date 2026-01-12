@@ -123,7 +123,7 @@ def check_balance(fec: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
-# Excel sheets
+# Excel helpers
 # ============================
 def list_sheets(file_bytes: bytes) -> list[str]:
     bio = BytesIO(file_bytes)
@@ -136,9 +136,6 @@ def read_sheet_raw(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return pd.read_excel(bio, sheet_name=sheet_name, header=None, engine="openpyxl")
 
 
-# ============================
-# Generic header finder (tolerant)
-# ============================
 def _norm_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("\u00a0", " ")
@@ -153,10 +150,6 @@ def _norm_cell(s: str) -> str:
 
 
 def find_header_row(raw: pd.DataFrame, start_row: int, end_row: int, required_labels: list[str]) -> tuple[int | None, dict]:
-    """
-    Find a header row containing all required labels (substring match, accent-tolerant).
-    Return (row_index, {label_norm: col_index})
-    """
     req = [_norm_cell(x) for x in required_labels]
     for r in range(start_row, min(end_row, len(raw))):
         row_vals = [_norm_cell(str(x) if str(x).lower() != "nan" else "") for x in raw.iloc[r].tolist()]
@@ -177,7 +170,7 @@ def find_header_row(raw: pd.DataFrame, start_row: int, end_row: int, required_la
 
 
 # ============================
-# Detect invoices in CAISSE sheet
+# CAISSE sheet parsing
 # ============================
 def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
     res = []
@@ -190,14 +183,7 @@ def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
     return res
 
 
-# ============================
-# Extract SALES (articles) from CAISSE sheet
-# ============================
 def extract_sales_lines(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return normalized sales lines:
-    invoice_number, invoice_date, tva_rate, ttc_net (Montant du)
-    """
     factures = find_facture_rows(raw)
     if not factures:
         return pd.DataFrame(columns=["invoice_number", "invoice_date", "tva_rate", "ttc_net", "source_row"])
@@ -209,7 +195,6 @@ def extract_sales_lines(raw: pd.DataFrame) -> pd.DataFrame:
         r0, inv, date_str = factures[idx]
         r1 = factures_with_end[idx + 1][0]
 
-        # Required headers (tolerant)
         header_row, cols = find_header_row(raw, r0, r1, ["Produits", "TVA", "Montant du"])
         if header_row is None:
             continue
@@ -243,14 +228,7 @@ def extract_sales_lines(raw: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ============================
-# Extract PAYMENTS from CAISSE sheet
-# ============================
 def extract_encaissements(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return normalized payments:
-    invoice_number, invoice_date, amount, mode
-    """
     factures = find_facture_rows(raw)
     if not factures:
         return pd.DataFrame(columns=["invoice_number", "invoice_date", "amount", "mode", "source_row"])
@@ -287,13 +265,9 @@ def extract_encaissements(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
-# Extract CHECK deposits from CHEQUES sheet
+# REMISES file parsing (optional)
 # ============================
 def extract_remises_cheques(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return:
-    bordereau_id, remise_date, total_montant
-    """
     starts = []
     for i in range(len(raw)):
         row = raw.iloc[i].astype(str).tolist()
@@ -313,7 +287,6 @@ def extract_remises_cheques(raw: pd.DataFrame) -> pd.DataFrame:
         r1 = starts_with_end[k + 1][0]
         remise_date = datetime.strptime(dstr, "%d/%m/%Y").date()
 
-        # find header with Date + Montant(€)
         header_row, cols = find_header_row(raw, r0, r1, ["Date", "Montant"])
         if header_row is None:
             continue
@@ -335,14 +308,7 @@ def extract_remises_cheques(raw: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ============================
-# Extract CASH deposits from ESPECES sheet
-# ============================
 def extract_remises_especes(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Table:
-    N° bordereau | Statut (contains date) | Montant
-    """
     header_row, cols = find_header_row(raw, 0, len(raw), ["N° bordereau", "Statut", "Montant"])
     if header_row is None:
         return pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
@@ -357,7 +323,6 @@ def extract_remises_especes(raw: pd.DataFrame) -> pd.DataFrame:
         if bord is None or str(bord).strip() == "" or str(bord).lower() == "nan":
             continue
 
-        # stop on total line
         if "total" in str(bord).strip().lower():
             break
 
@@ -375,13 +340,9 @@ def extract_remises_especes(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
-# Build FEC - SALES (Debit 53 / Credit 70 + TVA)
+# Build mappings from CSV text
 # ============================
 def build_vat_map_from_csv(text: str) -> dict:
-    """
-    Text CSV format with ';' separator:
-    TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
-    """
     text = (text or "").strip()
     if not text:
         return {}
@@ -403,10 +364,6 @@ def build_vat_map_from_csv(text: str) -> dict:
 
 
 def build_mode_map_from_csv(text: str) -> tuple[dict, dict]:
-    """
-    Text CSV format with ';' separator:
-    Mode;CompteNum;CompteLib
-    """
     text = (text or "").strip()
     if not text:
         return {}, {}
@@ -423,6 +380,9 @@ def build_mode_map_from_csv(text: str) -> tuple[dict, dict]:
     return acc, lib
 
 
+# ============================
+# Build FEC
+# ============================
 def build_fec_sales(sales_lines: pd.DataFrame,
                     journal_code: str,
                     journal_lib: str,
@@ -438,7 +398,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
         df = df.groupby(["invoice_number", "invoice_date", "tva_rate"], as_index=False)["ttc_net"].sum()
 
     fec_rows = []
-
     for _, row in df.iterrows():
         inv = str(row["invoice_number"])
         dt = row["invoice_date"]
@@ -510,9 +469,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
     return fec
 
 
-# ============================
-# Build FEC - PAYMENTS (Debit règlement / Credit 53)
-# ============================
 def build_fec_settlements(enc_df: pd.DataFrame,
                           journal_code: str,
                           journal_lib: str,
@@ -577,9 +533,6 @@ def build_fec_settlements(enc_df: pd.DataFrame,
     return fec
 
 
-# ============================
-# Build FEC - BANK DEPOSITS (512 D / 5112 C or 531 C)
-# ============================
 def build_fec_remises(remises_df: pd.DataFrame,
                       journal_code: str,
                       journal_lib: str,
@@ -638,10 +591,14 @@ def build_fec_remises(remises_df: pd.DataFrame,
 # ============================
 # Streamlit UI
 # ============================
-st.set_page_config(page_title="Optimum → FEC (ventes + encaissements + remises)", layout="wide")
-st.title("Export Optimum/AS3 → FEC (Ventes + Encaissements + Remises chèques/espèces)")
+st.set_page_config(page_title="Optimum → FEC (ventes + encaissements + remises optionnelles)", layout="wide")
+st.title("Export Optimum/AS3 → FEC (Ventes + Encaissements + Remises en banque optionnelles)")
 
-uploaded = st.file_uploader("Importer le fichier .xlsx (3 onglets : caisse + chèques + espèces)", type=["xlsx", "xls"])
+st.caption("1) Charge l'export CAISSE (obligatoire). 2) Charge éventuellement un export REMISES (chèques+espèces) séparé.")
+
+uploaded_caisse = st.file_uploader("1) Fichier CAISSE (.xlsx)", type=["xlsx", "xls"], key="caisse")
+
+uploaded_remises = st.file_uploader("2) Fichier REMISES (.xlsx) — optionnel", type=["xlsx", "xls"], key="remises")
 
 with st.sidebar:
     st.header("Paramètres")
@@ -657,20 +614,6 @@ with st.sidebar:
     st.subheader("Journal ENCAISSEMENTS")
     je_code = st.text_input("JournalCode encaissements", value="BQ")
     je_lib = st.text_input("JournalLib encaissements", value="Règlements")
-
-    st.subheader("Journal REMISES en banque")
-    jr_code = st.text_input("JournalCode remises", value="BQ")
-    jr_lib = st.text_input("JournalLib remises", value="Remises en banque")
-
-    st.subheader("Comptes remises")
-    compte_512 = st.text_input("Compte 512 (Banque) - Débit", value="512000")
-    lib_512 = st.text_input("Lib 512", value="Banque")
-
-    compte_5112 = st.text_input("Compte 5112 (Chèques) - Crédit", value="511200")
-    lib_5112 = st.text_input("Lib 5112", value="Chèques à encaisser")
-
-    compte_531 = st.text_input("Compte 531 (Espèces) - Crédit", value="531000")
-    lib_531 = st.text_input("Lib 531", value="Caisse espèces")
 
     st.subheader("Options")
     group_sales = st.checkbox("Regrouper ventes par facture + taux TVA", value=True)
@@ -700,39 +643,31 @@ tiers-payant;467000;Tiers payant à recevoir
 """
     mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
 
-if not uploaded:
-    st.info("Importe le fichier Excel pour démarrer.")
+    st.subheader("Paramètres REMISES en banque (si fichier remises fourni)")
+    jr_code = st.text_input("JournalCode remises", value="BQ")
+    jr_lib = st.text_input("JournalLib remises", value="Remises en banque")
+
+    compte_512 = st.text_input("Compte 512 (Banque) - Débit", value="512000")
+    lib_512 = st.text_input("Lib 512", value="Banque")
+
+    compte_5112 = st.text_input("Compte 5112 (Chèques) - Crédit", value="511200")
+    lib_5112 = st.text_input("Lib 5112", value="Chèques à encaisser")
+
+    compte_531 = st.text_input("Compte 531 (Espèces) - Crédit", value="531000")
+    lib_531 = st.text_input("Lib 531", value="Caisse espèces")
+
+if not uploaded_caisse:
+    st.info("Charge au moins le fichier CAISSE.")
     st.stop()
 
-file_bytes = uploaded.read()
-sheets = list_sheets(file_bytes)
+# ============================
+# Read CAISSE
+# ============================
+file_bytes_caisse = uploaded_caisse.read()
+sheets_caisse = list_sheets(file_bytes_caisse)
 
-def pick_default(patterns):
-    for s in sheets:
-        low = s.lower()
-        if any(p in low for p in patterns):
-            return s
-    return sheets[0]
-
-sheet_caisse = st.sidebar.selectbox(
-    "Onglet CAISSE",
-    sheets,
-    index=sheets.index(pick_default(["caisse", "operation", "opération", "releve", "relevé"]))
-)
-sheet_cheques = st.sidebar.selectbox(
-    "Onglet REMISES CHÈQUES",
-    sheets,
-    index=sheets.index(pick_default(["cheque", "chèque"]))
-)
-sheet_especes = st.sidebar.selectbox(
-    "Onglet REMISES ESPÈCES",
-    sheets,
-    index=sheets.index(pick_default(["espece", "espèce"]))
-)
-
-raw_caisse = read_sheet_raw(file_bytes, sheet_caisse)
-raw_cheques = read_sheet_raw(file_bytes, sheet_cheques)
-raw_especes = read_sheet_raw(file_bytes, sheet_especes)
+sheet_caisse = st.selectbox("Onglet CAISSE à utiliser", sheets_caisse, index=0)
+raw_caisse = read_sheet_raw(file_bytes_caisse, sheet_caisse)
 
 # ============================
 # Parse mappings
@@ -750,51 +685,13 @@ except Exception as e:
     st.stop()
 
 # ============================
-# Extract data
+# Extract CAISSE data
 # ============================
 sales_lines = extract_sales_lines(raw_caisse)
 enc = extract_encaissements(raw_caisse)
-rem_cheques = extract_remises_cheques(raw_cheques)
-rem_especes = extract_remises_especes(raw_especes)
 
 # ============================
-# Metrics
-# ============================
-st.subheader("Synthèse")
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
-    st.metric("Lignes ventes", int(len(sales_lines)))
-with c2:
-    st.metric("Factures", int(sales_lines["invoice_number"].nunique()) if not sales_lines.empty else 0)
-with c3:
-    st.metric("Lignes encaissements", int(len(enc)))
-with c4:
-    st.metric("Total encaissé", f"{enc['amount'].sum():,.2f} €".replace(",", " ") if not enc.empty else "0,00 €")
-with c5:
-    total_remises = 0.0
-    if not rem_cheques.empty:
-        total_remises += rem_cheques["total_montant"].sum()
-    if not rem_especes.empty:
-        total_remises += rem_especes["total_montant"].sum()
-    st.metric("Total remises", f"{total_remises:,.2f} €".replace(",", " "))
-
-# ============================
-# Warnings mapping
-# ============================
-if not sales_lines.empty:
-    rates = sorted(set([round(float(x), 6) for x in sales_lines["tva_rate"].unique().tolist()]))
-    unmapped_rates = [x for x in rates if x not in vat_map]
-    if unmapped_rates:
-        st.warning("Taux TVA sans mapping (ventes ignorées pour ces taux) : " + ", ".join([str(x) for x in unmapped_rates]))
-
-if not enc.empty:
-    modes = sorted(enc["mode"].unique().tolist())
-    unmapped_modes = [m for m in modes if not mode_acc.get(m)]
-    if unmapped_modes:
-        st.warning("Modes sans mapping (encaissements ignorés pour ces modes) : " + ", ".join(unmapped_modes))
-
-# ============================
-# Build FEC
+# Build CAISSE FEC
 # ============================
 fec_sales = build_fec_sales(
     sales_lines=sales_lines,
@@ -817,53 +714,103 @@ fec_sett = build_fec_settlements(
     group_same_mode_per_invoice=group_payments,
 )
 
-fec_rem_cheques = build_fec_remises(
-    remises_df=rem_cheques,
-    journal_code=jr_code,
-    journal_lib=jr_lib,
-    compte_debit=compte_512,
-    lib_debit=lib_512,
-    compte_credit=compte_5112,
-    lib_credit=lib_5112,
-    prefix_num="REMCHQ",
-    lib_prefix="Remise chèques bordereau",
-)
-
-fec_rem_especes = build_fec_remises(
-    remises_df=rem_especes,
-    journal_code=jr_code,
-    journal_lib=jr_lib,
-    compte_debit=compte_512,
-    lib_debit=lib_512,
-    compte_credit=compte_531,
-    lib_credit=lib_531,
-    prefix_num="REMESP",
-    lib_prefix="Remise espèces bordereau",
-)
-
-fec_all = pd.concat([fec_sales, fec_sett, fec_rem_cheques, fec_rem_especes], ignore_index=True)
+fec_all_parts = [fec_sales, fec_sett]
 
 # ============================
-# Display previews
+# Optional REMISES file
 # ============================
+rem_cheques = pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
+rem_especes = pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
+fec_rem_cheques = pd.DataFrame(columns=FEC_COLUMNS)
+fec_rem_especes = pd.DataFrame(columns=FEC_COLUMNS)
+
+if uploaded_remises is not None:
+    file_bytes_remises = uploaded_remises.read()
+    sheets_remises = list_sheets(file_bytes_remises)
+
+    st.subheader("Paramétrage fichier REMISES (optionnel)")
+    sheet_cheques = st.selectbox("Onglet REMISES CHÈQUES", sheets_remises, index=0, key="sheet_cheques")
+    sheet_especes = st.selectbox("Onglet REMISES ESPÈCES", sheets_remises, index=min(1, len(sheets_remises)-1), key="sheet_especes")
+
+    raw_cheques = read_sheet_raw(file_bytes_remises, sheet_cheques)
+    raw_especes = read_sheet_raw(file_bytes_remises, sheet_especes)
+
+    rem_cheques = extract_remises_cheques(raw_cheques)
+    rem_especes = extract_remises_especes(raw_especes)
+
+    fec_rem_cheques = build_fec_remises(
+        remises_df=rem_cheques,
+        journal_code=jr_code,
+        journal_lib=jr_lib,
+        compte_debit=compte_512,
+        lib_debit=lib_512,
+        compte_credit=compte_5112,
+        lib_credit=lib_5112,
+        prefix_num="REMCHQ",
+        lib_prefix="Remise chèques bordereau",
+    )
+
+    fec_rem_especes = build_fec_remises(
+        remises_df=rem_especes,
+        journal_code=jr_code,
+        journal_lib=jr_lib,
+        compte_debit=compte_512,
+        lib_debit=lib_512,
+        compte_credit=compte_531,
+        lib_credit=lib_531,
+        prefix_num="REMESP",
+        lib_prefix="Remise espèces bordereau",
+    )
+
+    fec_all_parts.extend([fec_rem_cheques, fec_rem_especes])
+
+fec_all = pd.concat(fec_all_parts, ignore_index=True)
+
+# ============================
+# Display
+# ============================
+st.subheader("Synthèse CAISSE")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Lignes ventes", int(len(sales_lines)))
+with c2:
+    st.metric("Factures", int(sales_lines["invoice_number"].nunique()) if not sales_lines.empty else 0)
+with c3:
+    st.metric("Lignes encaissements", int(len(enc)))
+with c4:
+    st.metric("Total encaissé", f"{enc['amount'].sum():,.2f} €".replace(",", " ") if not enc.empty else "0,00 €")
+
+if uploaded_remises is not None:
+    st.subheader("Synthèse REMISES")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.metric("Bordereaux chèques", int(len(rem_cheques)))
+    with r2:
+        st.metric("Bordereaux espèces", int(len(rem_especes)))
+    with r3:
+        total_rem = 0.0
+        if not rem_cheques.empty:
+            total_rem += rem_cheques["total_montant"].sum()
+        if not rem_especes.empty:
+            total_rem += rem_especes["total_montant"].sum()
+        st.metric("Total remises", f"{total_rem:,.2f} €".replace(",", " "))
+
 st.subheader("Aperçu - Ventes (articles)")
 st.dataframe(sales_lines.head(200), use_container_width=True)
 
 st.subheader("Aperçu - Encaissements")
 st.dataframe(enc.head(200), use_container_width=True)
 
-st.subheader("Aperçu - Bordereaux chèques")
-st.dataframe(rem_cheques, use_container_width=True)
+if uploaded_remises is not None:
+    st.subheader("Aperçu - Bordereaux chèques")
+    st.dataframe(rem_cheques, use_container_width=True)
 
-st.subheader("Aperçu - Bordereaux espèces")
-st.dataframe(rem_especes, use_container_width=True)
+    st.subheader("Aperçu - Bordereaux espèces")
+    st.dataframe(rem_especes, use_container_width=True)
 
 st.subheader("Aperçu FEC - Global")
 st.dataframe(fec_all.head(300), use_container_width=True)
 
-# ============================
-# Balance checks
-# ============================
 st.subheader("Contrôles d'équilibre")
 chk_all = check_balance(fec_all)
 if chk_all.empty:
@@ -876,9 +823,6 @@ else:
         st.error("Certaines écritures ne sont pas équilibrées ❌")
         st.dataframe(bad, use_container_width=True)
 
-# ============================
-# Downloads
-# ============================
 st.subheader("Téléchargements")
 col1, col2, col3, col4 = st.columns(4)
 
@@ -889,7 +833,9 @@ with col2:
     st.download_button("CSV FEC - Encaissements", data=to_csv_bytes(fec_sett, sep=csv_sep),
                        file_name="fec_encaissements.csv", mime="text/csv")
 with col3:
-    st.download_button("CSV FEC - Remises", data=to_csv_bytes(pd.concat([fec_rem_cheques, fec_rem_especes], ignore_index=True), sep=csv_sep),
+    # only meaningful if remises file provided; still downloads empty CSV otherwise
+    fec_rem_all = pd.concat([fec_rem_cheques, fec_rem_especes], ignore_index=True)
+    st.download_button("CSV FEC - Remises (optionnel)", data=to_csv_bytes(fec_rem_all, sep=csv_sep),
                        file_name="fec_remises.csv", mime="text/csv")
 with col4:
     st.download_button("CSV FEC - Global", data=to_csv_bytes(fec_all, sep=csv_sep),
