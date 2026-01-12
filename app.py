@@ -812,7 +812,7 @@ with st.sidebar:
     st.subheader("Grille TVA → comptes 70 + TVA")
     st.caption("Format CSV (;) : TauxTVA;Compte70;Lib70;CompteTVA;LibTVA")
     vat_default_text = """TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
-0.20;707000;Ventes;445710;TVA collectée 20%
+0.20;707000;Ventes;4457100;TVA collectée 20%
 0.10;707010;Ventes 10%;445712;TVA collectée 10%
 0.055;707005;Ventes 5,5%;445713;TVA collectée 5,5%
 0.00;707000;Ventes exonérées;445700;TVA collectée 0%
@@ -823,10 +823,10 @@ with st.sidebar:
     st.caption("Format CSV (;) : Mode;CompteNum;CompteLib")
     mode_default_text = """Mode;CompteNum;CompteLib
 carte bancaire;511000;CB à encaisser
-chèque;511200;Chèques à encaisser
-espèces;531000;Caisse
-virement;512000;Banque
-tiers-payant;467000;Tiers payant à recevoir
+chèque;51120000;Chèques à encaisser
+espèces;53100000;Caisse
+virement;51200000;Banque
+tiers-payant;58400000;Tiers payant à recevoir
 """
     mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
 
