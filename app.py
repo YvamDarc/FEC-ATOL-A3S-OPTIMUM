@@ -8,7 +8,7 @@ import streamlit as st
 
 
 # ============================
-# FEC columns (format "classique")
+# Constantes FEC
 # ============================
 FEC_COLUMNS = [
     "JournalCode", "JournalLib",
@@ -24,12 +24,6 @@ FEC_COLUMNS = [
 ]
 
 FACTURE_RE = re.compile(r"Facture numéro\s+(\d+)\s+émise le\s+(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
-
-# ⚠️ on ne touche pas aux remises (comme demandé)
-BORDEREAU_RE = re.compile(
-    r"Bordereau\s*N°\s*:\s*([A-Za-z0-9\-]+).*?Remis\s+le\s+(\d{2}/\d{2}/\d{4})",
-    re.IGNORECASE
-)
 
 MODE_NORMALIZE = {
     "carte bancaire": "carte bancaire",
@@ -47,7 +41,7 @@ MODE_NORMALIZE = {
 
 
 # ============================
-# Helpers
+# Helpers parsing
 # ============================
 def normalize_mode(x) -> str:
     if x is None or (isinstance(x, float) and np.isnan(x)):
@@ -60,7 +54,6 @@ def normalize_mode(x) -> str:
 
 
 def parse_eur(val) -> float:
-    """Parse '156,85€', '13,00€', 13, 13.0."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float, np.integer, np.floating)):
@@ -72,7 +65,8 @@ def parse_eur(val) -> float:
     if s == "" or s.lower() == "nan":
         return 0.0
 
-    s = s.replace("€", "").replace("\u00a0", " ").strip().replace(" ", "")
+    s = s.replace("€", "").replace("\u00a0", " ").strip()
+    s = s.replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "")
     s = s.replace(",", ".")
@@ -87,7 +81,7 @@ def parse_eur(val) -> float:
 
 
 def parse_tva_rate(val) -> float:
-    """Parse '20,00%' -> 0.20 ; 20 -> 0.20 ; '0' -> 0.0"""
+    """'20,00%'->0.20 ; 20->0.20 ; '0'->0.0"""
     if val is None:
         return 0.0
     if isinstance(val, (int, float, np.integer, np.floating)):
@@ -100,6 +94,7 @@ def parse_tva_rate(val) -> float:
     s = s.replace("%", "").strip()
     if s == "" or s == "nan":
         return 0.0
+
     s = s.replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "")
@@ -141,7 +136,6 @@ def read_sheet_raw(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
 def _norm_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("\u00a0", " ")
-    # rough accent normalization for matching
     s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
     s = s.replace("à", "a").replace("â", "a")
     s = s.replace("î", "i").replace("ï", "i")
@@ -172,7 +166,7 @@ def find_header_row(raw: pd.DataFrame, start_row: int, end_row: int, required_la
 
 
 # ============================
-# CAISSE parsing
+# Extraction Factures + Encaissements
 # ============================
 def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
     res = []
@@ -187,93 +181,8 @@ def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
 
 def extract_invoice_sales_bundle(raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Une ligne par facture avec :
-    - invoice_number, invoice_date
-    - total_ttc (Montant du total facture)
-    - vat_amount (Montant TVA du total facture si dispo sinon recalcul)
-    - vat_rate (si identifiable sur la ligne total, sinon None)
-    - sum_detail_ttc (somme des Montant du lignes détaillées)
-    - has_detail (bool)
-    - has_total (bool)
-    """
-    factures = find_facture_rows(raw)
-    if not factures:
-        return pd.DataFrame(columns=[
-            "invoice_number", "invoice_date", "total_ttc", "vat_amount", "vat_rate",
-            "sum_detail_ttc", "has_detail", "has_total", "source_row_total"
-        ])
-
-    factures_with_end = factures + [(len(raw), "", "")]
-    out = []
-
-    for idx in range(len(factures)):
-        r0, inv, date_str = factures[idx]
-        r1 = factures_with_end[idx + 1][0]
-        inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
-
-        header_row, cols = find_header_row(raw, r0, r1, ["Produits", "TVA", "Montant TVA", "Montant du"])
-        if header_row is None:
-            continue
-
-        c_prod = cols[_norm_cell("Produits")]
-        c_rate = cols[_norm_cell("TVA")]
-        c_vat = cols[_norm_cell("Montant TVA")]
-        c_ttc = cols[_norm_cell("Montant du")]
-
-        sum_detail = 0.0
-        has_detail = False
-
-        total_ttc = None
-        total_vat = None
-        total_rate = None
-        source_row_total = None
-
-        for r in range(header_row + 1, r1):
-            prod = raw.iat[r, c_prod]
-            prod_s = "" if prod is None else str(prod).strip()
-            prod_is_empty = (prod_s == "" or prod_s.lower() == "nan")
-
-            ttc = parse_eur(raw.iat[r, c_ttc])
-            vat = parse_eur(raw.iat[r, c_vat])
-            rate = parse_tva_rate(raw.iat[r, c_rate])
-
-            if not prod_is_empty:
-                if abs(ttc) > 1e-9:
-                    sum_detail += ttc
-                    has_detail = True
-                continue
-
-            # ligne "total" probable : produit vide + TTC non nul
-            if abs(ttc) > 1e-9:
-                total_ttc = round(float(ttc), 2)
-                total_vat = round(float(vat), 2) if abs(vat) > 1e-9 else None
-                total_rate = round(float(rate), 6) if abs(rate) > 1e-9 else None
-                source_row_total = r
-
-        sum_detail = round(float(sum_detail), 2)
-
-        out.append({
-            "invoice_number": str(inv),
-            "invoice_date": inv_date,
-            "total_ttc": total_ttc,
-            "vat_amount": total_vat,
-            "vat_rate": total_rate,
-            "sum_detail_ttc": sum_detail,
-            "has_detail": bool(has_detail),
-            "has_total": total_ttc is not None,
-            "source_row_total": source_row_total
-        })
-
-    return pd.DataFrame(out)
-
-
-def extract_invoice_sales_bundle(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Une ligne par facture.
-    IMPORTANT : on récupère le TTC (= Montant du) sur la VRAIE ligne total :
-    - Produits vide
-    - Montant du non nul
-    - et au moins 1 des colonnes (Total opération / Montant TVA) est renseignée (même 0)
+    1 ligne par facture.
+    TTC = valeur 'Montant du' sur la ligne TOTAL (produit vide).
     """
     factures = find_facture_rows(raw)
     if not factures:
@@ -291,7 +200,6 @@ def extract_invoice_sales_bundle(raw: pd.DataFrame) -> pd.DataFrame:
         r1 = factures_with_end[idx + 1][0]
         inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
 
-        # On exige ces colonnes pour fiabiliser la détection de la ligne total
         header_row, cols = find_header_row(
             raw, r0, r1,
             ["Produits", "TVA", "Total opération", "Montant TVA", "Montant du"]
@@ -305,40 +213,41 @@ def extract_invoice_sales_bundle(raw: pd.DataFrame) -> pd.DataFrame:
         c_vat = cols[_norm_cell("Montant TVA")]
         c_ttc = cols[_norm_cell("Montant du")]
 
-        best_total = None  # on garde la DERNIERE ligne total valide rencontrée
+        best_total = None
 
         for r in range(header_row + 1, r1):
             prod = raw.iat[r, c_prod]
             prod_s = "" if prod is None else str(prod).strip()
-            prod_is_empty = (prod_s == "" or prod_s.lower() == "nan")
-
-            if not prod_is_empty:
-                continue
+            if prod_s and prod_s.lower() != "nan":
+                continue  # ligne détaillée
 
             ttc = parse_eur(raw.iat[r, c_ttc])
             if abs(ttc) < 1e-9:
                 continue
 
-            total_op = parse_eur(raw.iat[r, c_total_op])
-            vat_amt = parse_eur(raw.iat[r, c_vat])
-            rate = parse_tva_rate(raw.iat[r, c_rate])
+            total_op = raw.iat[r, c_total_op]
+            vat_amt = raw.iat[r, c_vat]
+            rate = raw.iat[r, c_rate]
 
-            # Condition "ligne total" robuste :
-            # produit vide + TTC non nul + (total_op renseigné OU TVA renseignée)
-            if abs(total_op) > 1e-9 or abs(vat_amt) > 1e-9 or str(raw.iat[r, c_total_op]).strip() != "" or str(raw.iat[r, c_vat]).strip() != "":
+            total_op_num = parse_eur(total_op)
+            vat_amt_num = parse_eur(vat_amt)
+            rate_num = parse_tva_rate(rate)
+
+            # ligne total = produit vide + TTC + (col total_op ou col TVA renseignée, même 0)
+            total_op_present = str(total_op).strip().lower() not in ("", "nan")
+            vat_present = str(vat_amt).strip().lower() not in ("", "nan")
+
+            if total_op_present or vat_present or abs(total_op_num) > 1e-9 or abs(vat_amt_num) > 1e-9:
                 best_total = {
                     "invoice_number": str(inv),
                     "invoice_date": inv_date,
                     "total_ttc": round(float(ttc), 2),
-                    "total_vat": round(float(vat_amt), 2) if abs(vat_amt) > 1e-9 else 0.0,
-                    "vat_rate": round(float(rate), 6) if abs(rate) > 1e-9 else None,
+                    "total_vat": round(float(vat_amt_num), 2),
+                    "vat_rate": round(float(rate_num), 6) if abs(rate_num) > 1e-9 else None,
                     "source_row_total": r
                 }
 
-        if best_total is not None:
-            out.append(best_total)
-        else:
-            # pas de total détecté => on ignore en ventes (car tu veux 1 écriture / facture basée sur Montant du)
+        if best_total is None:
             out.append({
                 "invoice_number": str(inv),
                 "invoice_date": inv_date,
@@ -347,15 +256,106 @@ def extract_invoice_sales_bundle(raw: pd.DataFrame) -> pd.DataFrame:
                 "vat_rate": None,
                 "source_row_total": None
             })
+        else:
+            out.append(best_total)
 
     return pd.DataFrame(out)
 
 
+def extract_encaissements(raw: pd.DataFrame) -> pd.DataFrame:
+    factures = find_facture_rows(raw)
+    if not factures:
+        return pd.DataFrame(columns=["invoice_number", "invoice_date", "amount", "mode", "source_row"])
+
+    factures_with_end = factures + [(len(raw), "", "")]
+    rows = []
+
+    for idx in range(len(factures)):
+        r0, inv, date_str = factures[idx]
+        r1 = factures_with_end[idx + 1][0]
+
+        header_row, cols = find_header_row(raw, r0, r1, ["Montant encaissé", "Mode de règlement"])
+        if header_row is None:
+            continue
+
+        c_amt = cols[_norm_cell("Montant encaissé")]
+        c_mode = cols[_norm_cell("Mode de règlement")]
+        inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
+
+        for r in range(header_row + 1, r1):
+            amt = parse_eur(raw.iat[r, c_amt])
+            md = normalize_mode(raw.iat[r, c_mode])
+            if md and abs(amt) > 1e-9:
+                rows.append({
+                    "invoice_number": str(inv),
+                    "invoice_date": inv_date,
+                    "amount": round(float(amt), 2),
+                    "mode": md,
+                    "source_row": r
+                })
+
+    return pd.DataFrame(rows)
+
+
+# ============================
+# Mappings TVA / modes
+# ============================
+def build_vat_map_from_csv(text: str) -> dict:
+    """
+    CSV (;) : TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+
+    df = pd.read_csv(BytesIO(text.encode("utf-8")), sep=";")
+    needed = {"TauxTVA", "Compte70", "Lib70", "CompteTVA", "LibTVA"}
+    if not needed.issubset(set(df.columns)):
+        raise ValueError(f"Colonnes attendues: {sorted(needed)}")
+
+    vat_map = {}
+    for _, r in df.iterrows():
+        try:
+            rate = round(float(r["TauxTVA"]), 6)
+        except Exception:
+            continue
+        vat_map[rate] = {
+            "rev_acc": str(r["Compte70"]).strip(),
+            "rev_lib": str(r["Lib70"]).strip(),
+            "vat_acc": str(r["CompteTVA"]).strip(),
+            "vat_lib": str(r["LibTVA"]).strip(),
+        }
+    return vat_map
+
+
+def build_mode_map_from_csv(text: str) -> tuple[dict, dict]:
+    """
+    CSV (;) : Mode;CompteNum;CompteLib
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}, {}
+
+    df = pd.read_csv(BytesIO(text.encode("utf-8")), sep=";")
+    needed = {"Mode", "CompteNum", "CompteLib"}
+    if not needed.issubset(set(df.columns)):
+        raise ValueError(f"Colonnes attendues: {sorted(needed)}")
+
+    acc = {}
+    lib = {}
+    for _, r in df.iterrows():
+        md = normalize_mode(r["Mode"])
+        if not md:
+            continue
+        acc[md] = str(r["CompteNum"]).strip()
+        lib[md] = str(r["CompteLib"]).strip()
+    return acc, lib
+
+
+# ============================
+# Ventes : 1 écriture / facture
+# ============================
 def _infer_rate_from_ttc_vat(ttc: float, vat: float) -> float | None:
-    """
-    Si on a TTC et TVA, on peut déduire le taux :
-      vat = ht * rate, ht = ttc - vat => rate = vat / (ttc - vat)
-    """
     ht = ttc - vat
     if abs(ht) < 1e-9:
         return None
@@ -366,7 +366,6 @@ def _infer_rate_from_ttc_vat(ttc: float, vat: float) -> float | None:
 
 
 def _closest_rate_in_map(rate: float, vat_map: dict, tol: float = 0.002) -> float | None:
-    """Matche le taux au plus proche dans la grille TVA (tolérance ~0,2 point)."""
     if not vat_map:
         return None
     best = min(vat_map.keys(), key=lambda x: abs(x - rate))
@@ -387,11 +386,6 @@ def build_fec_sales_per_invoice(
     compte_tva_fallback: str,
     lib_tva_fallback: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    1 écriture par facture (EcritureNum = numéro facture, PieceRef = numéro facture).
-    TTC = Montant du (ligne total).
-    TVA = recalcul via taux si dispo / sinon taux déduit / sinon TVA ligne total.
-    """
     if invoices.empty:
         return pd.DataFrame(columns=FEC_COLUMNS), pd.DataFrame(columns=["invoice_number", "invoice_date", "reason"])
 
@@ -409,14 +403,14 @@ def build_fec_sales_per_invoice(
         ttc = round(float(invr["total_ttc"]), 2)
         vat_amt_line = round(float(invr["total_vat"] or 0.0), 2)
 
-        # 1) déterminer le taux : priorité au taux lu, sinon déduction via TTC/TVA
+        # taux : priorité au taux lu, sinon déduction via TTC/TVA
         rate = invr["vat_rate"]
         if rate is not None and not pd.isna(rate):
             rate = round(float(rate), 6)
         else:
             rate = _infer_rate_from_ttc_vat(ttc, vat_amt_line) if abs(vat_amt_line) > 0.009 else None
 
-        # 2) si on a un taux, on RECALCULE la TVA selon ta règle
+        # TVA recalculée si taux connu (règle souhaitée)
         if rate is not None:
             tva = round((ttc / (1.0 + rate)) * rate, 2)
         else:
@@ -424,7 +418,6 @@ def build_fec_sales_per_invoice(
 
         ht = round(ttc - tva, 2)
 
-        # 3) mapping comptes selon le taux (en rapprochant au plus proche)
         mapped_rate = _closest_rate_in_map(rate, vat_map) if rate is not None else None
 
         if mapped_rate is not None:
@@ -437,9 +430,9 @@ def build_fec_sales_per_invoice(
             lib_70 = lib_70_controle
             acc_tva = compte_tva_fallback
             lib_tva = lib_tva_fallback
-            warnings.append({"invoice_number": inv, "invoice_date": dt, "reason": f"Taux non trouvé/mappé (rate={rate}) -> HT en {compte_70_controle} + TVA fallback"})
+            warnings.append({"invoice_number": inv, "invoice_date": dt, "reason": f"Taux non mappé (rate={rate}) -> HT en contrôle + TVA fallback"})
 
-        # ✅ Tu voulais : EcritureNum = numéro facture (pas de -VT)
+        # EcritureNum et PieceRef = NUMERO FACTURE
         ecriture_num = inv
         lib_ecr = f"Vente facture {inv}"
 
@@ -495,9 +488,8 @@ def build_fec_sales_per_invoice(
     return fec, warn_df
 
 
-
 # ============================
-# Encaissements (inchangé)
+# Encaissements
 # ============================
 def build_fec_settlements(enc_df: pd.DataFrame,
                           journal_code: str,
@@ -564,10 +556,10 @@ def build_fec_settlements(enc_df: pd.DataFrame,
 
 
 # ============================
-# Streamlit UI
+# Streamlit APP
 # ============================
-st.set_page_config(page_title="Optimum → FEC (ventes par facture)", layout="wide")
-st.title("Export Optimum/AS3 → FEC (Ventes = 1 écriture par facture)")
+st.set_page_config(page_title="Optimum → FEC", layout="wide")
+st.title("Optimum / AS3 export caisse → FEC (Ventes par facture + Encaissements)")
 
 uploaded_caisse = st.file_uploader("Fichier CAISSE (.xlsx)", type=["xlsx", "xls"], key="caisse")
 
@@ -603,10 +595,10 @@ with st.sidebar:
     st.subheader("Grille TVA → comptes 70 + TVA")
     st.caption("Format CSV (;) : TauxTVA;Compte70;Lib70;CompteTVA;LibTVA")
     vat_default_text = """TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
-0.20;707000;Ventes;445710;TVA collectée 20%
-0.10;707010;Ventes 10%;445712;TVA collectée 10%
-0.055;707005;Ventes 5,5%;445713;TVA collectée 5,5%
-0.00;707000;Ventes exonérées;445700;TVA collectée 0%
+0.20;708000;Ventes;445710;TVA collectée 20%
+0.055;708005;Ventes 5,5%;445713;TVA collectée 5,5%
+0.10;708010;Ventes 10%;445712;TVA collectée 10%
+0.00;708000;Ventes exonérées;445700;TVA collectée 0%
 """
     vat_text = st.text_area("Grille TVA", value=vat_default_text, height=170)
 
@@ -625,61 +617,56 @@ if not uploaded_caisse:
     st.info("Charge le fichier CAISSE.")
     st.stop()
 
-file_bytes_caisse = uploaded_caisse.read()
-sheets_caisse = list_sheets(file_bytes_caisse)
-sheet_caisse = st.selectbox("Onglet CAISSE à utiliser", sheets_caisse, index=0)
-raw_caisse = read_sheet_raw(file_bytes_caisse, sheet_caisse)
+# Lecture Excel
+file_bytes = uploaded_caisse.read()
+sheets = list_sheets(file_bytes)
+sheet = st.selectbox("Onglet CAISSE à utiliser", sheets, index=0)
+raw = read_sheet_raw(file_bytes, sheet)
 
+# Mappings
 vat_map = build_vat_map_from_csv(vat_text)
 mode_acc, mode_lib = build_mode_map_from_csv(mode_text)
 
-# ==== Extraction factures (ventes) + encaissements
-invoices_sales = extract_invoice_sales_bundle(raw_caisse)
-enc = extract_encaissements(raw_caisse)
+# Extraction
+invoices_sales = extract_invoice_sales_bundle(raw)
+enc = extract_encaissements(raw)
 
-# ==== VENTES : 1 écriture par facture, TVA recalculée via taux si dispo
+# Construction FEC
 fec_sales, sales_warnings = build_fec_sales_per_invoice(
     invoices=invoices_sales,
-    journal_code=jv_code,
-    journal_lib=jv_lib,
-    compte_53=compte_53,
-    lib_53=lib_53,
+    journal_code=jv_code, journal_lib=jv_lib,
+    compte_53=compte_53, lib_53=lib_53,
     vat_map=vat_map,
-    compte_70_controle=compte_70_controle,
-    lib_70_controle=lib_70_controle,
-    compte_tva_fallback=compte_tva_fallback,
-    lib_tva_fallback=lib_tva_fallback,
+    compte_70_controle=compte_70_controle, lib_70_controle=lib_70_controle,
+    compte_tva_fallback=compte_tva_fallback, lib_tva_fallback=lib_tva_fallback
 )
 
-# ==== ENCAISSEMENTS inchangés
-fec_sett = build_fec_settlements(
+fec_enc = build_fec_settlements(
     enc_df=enc,
-    journal_code=je_code,
-    journal_lib=je_lib,
-    compte_53=compte_53,
-    lib_53=lib_53,
+    journal_code=je_code, journal_lib=je_lib,
+    compte_53=compte_53, lib_53=lib_53,
     mode_to_debit_account=mode_acc,
     mode_to_debit_lib=mode_lib,
-    group_same_mode_per_invoice=group_payments,
+    group_same_mode_per_invoice=group_payments
 )
 
-fec_all = pd.concat([fec_sales, fec_sett], ignore_index=True)
+fec_all = pd.concat([fec_sales, fec_enc], ignore_index=True)
 
-# ==== Affichages
-st.subheader("Aperçu factures (base ventes)")
-st.dataframe(invoices_sales.head(200), use_container_width=True)
+# Affichage
+st.subheader("Factures (base ventes)")
+st.dataframe(invoices_sales.head(300), use_container_width=True)
 
-if sales_warnings is not None and not sales_warnings.empty:
+if not sales_warnings.empty:
     st.subheader("Avertissements ventes")
     st.dataframe(sales_warnings, use_container_width=True)
 
-st.subheader("Aperçu encaissements")
-st.dataframe(enc.head(200), use_container_width=True)
+st.subheader("Encaissements")
+st.dataframe(enc.head(300), use_container_width=True)
 
-st.subheader("Aperçu FEC (global)")
-st.dataframe(fec_all.head(300), use_container_width=True)
+st.subheader("FEC (global) - aperçu")
+st.dataframe(fec_all.head(400), use_container_width=True)
 
-st.subheader("Contrôles d'équilibre")
+st.subheader("Contrôle équilibre par écriture")
 chk = check_balance(fec_all)
 if chk.empty:
     st.info("Aucune écriture générée.")
@@ -691,11 +678,12 @@ else:
         st.error("Certaines écritures ne sont pas équilibrées ❌")
         st.dataframe(bad, use_container_width=True)
 
+# Download
 st.subheader("Téléchargements")
 c1, c2, c3 = st.columns(3)
 with c1:
     st.download_button("CSV FEC - Ventes (VT)", data=to_csv_bytes(fec_sales, sep=csv_sep), file_name="fec_ventes.csv", mime="text/csv")
 with c2:
-    st.download_button("CSV FEC - Encaissements", data=to_csv_bytes(fec_sett, sep=csv_sep), file_name="fec_encaissements.csv", mime="text/csv")
+    st.download_button("CSV FEC - Encaissements", data=to_csv_bytes(fec_enc, sep=csv_sep), file_name="fec_encaissements.csv", mime="text/csv")
 with c3:
     st.download_button("CSV FEC - Global", data=to_csv_bytes(fec_all, sep=csv_sep), file_name="fec_global.csv", mime="text/csv")
