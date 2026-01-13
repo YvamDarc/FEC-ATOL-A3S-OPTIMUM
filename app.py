@@ -814,7 +814,7 @@ with st.sidebar:
     vat_default_text = """TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
 0.20;707000;Ventes;445710;TVA collectée 20%
 0.10;707010;Ventes 10%;445712;TVA collectée 10%
-0.055;707005;Ventes 5,5%;445713;TVA collectée 5,5%
+0.055;707005;Ventes 5,5%;445711;TVA collectée 5,5%
 0.00;707000;Ventes exonérées;445700;TVA collectée 0%
 """
     vat_text = st.text_area("Grille TVA", value=vat_default_text, height=170)
