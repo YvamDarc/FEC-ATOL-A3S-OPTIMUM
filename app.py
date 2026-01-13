@@ -784,7 +784,7 @@ with st.sidebar:
     st.header("Paramètres")
 
     st.subheader("Compte 53 (caisse à ventiler)")
-    compte_53 = st.text_input("Compte 53", value="530000")
+    compte_53 = st.text_input("Compte 53", value="53000000")
     lib_53 = st.text_input("Libellé 53", value="Caisse à ventiler")
 
     st.subheader("Journal VENTES (CA)")
@@ -796,7 +796,7 @@ with st.sidebar:
     je_lib = st.text_input("JournalLib encaissements", value="Règlements")
 
     st.subheader("Mode contrôle (factures non détaillées / incohérentes)")
-    compte_70_controle = st.text_input("Compte 70 de contrôle (HT)", value="708000")
+    compte_70_controle = st.text_input("Compte 70 de contrôle (HT)", value="70780000")
     lib_70_controle = st.text_input("Libellé 70 contrôle", value="Ventes – contrôle Optimum")
 
     compte_tva_fallback = st.text_input("Compte TVA fallback (si taux non reconnu)", value="445799")
