@@ -826,7 +826,7 @@ carte bancaire;511000;CB à encaisser
 chèque;511200;Chèques à encaisser
 espèces;531000;Caisse
 virement;512000;Banque
-tiers-payant;467000;Tiers payant à recevoir
+tiers-payant;58400000;Tiers payant à recevoir
 """
     mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
 
