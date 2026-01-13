@@ -792,7 +792,7 @@ with st.sidebar:
     jv_lib = st.text_input("JournalLib ventes", value="Ventes caisse")
 
     st.subheader("Journal ENCAISSEMENTS")
-    je_code = st.text_input("JournalCode encaissements", value="BQ")
+    je_code = st.text_input("JournalCode encaissements", value="CS")
     je_lib = st.text_input("JournalLib encaissements", value="Règlements")
 
     st.subheader("Mode contrôle (factures non détaillées / incohérentes)")
@@ -822,10 +822,10 @@ with st.sidebar:
     st.subheader("Grille modes de règlement → compte Débit")
     st.caption("Format CSV (;) : Mode;CompteNum;CompteLib")
     mode_default_text = """Mode;CompteNum;CompteLib
-carte bancaire;511000;CB à encaisser
-chèque;511200;Chèques à encaisser
-espèces;531000;Caisse
-virement;512000;Banque
+carte bancaire;5830000;CB à encaisser
+chèque;53200000;Chèques à encaisser
+espèces;53000000;Caisse
+virement;5850000;Banque
 tiers-payant;58400000;Tiers payant à recevoir
 """
     mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
