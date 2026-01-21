@@ -112,9 +112,35 @@ def parse_tva_rate(val) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
-def to_csv_bytes(df: pd.DataFrame, sep: str = ";") -> bytes:
-    return df.to_csv(index=False, sep=sep, encoding="utf-8-sig").encode("utf-8-sig")
+def to_fec_txt_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Export FEC en .txt séparateur TAB.
+    - séparateur = tabulation
+    - décimales = point (exigé dans beaucoup d'import FEC)
+    - pas d'index
+    - UTF-8 BOM (évite les soucis d'accents dans Excel/logiciels)
+    """
+    if df is None or df.empty:
+        return "".encode("utf-8-sig")
 
+    out = df.copy()
+
+    # Sécuriser les colonnes Debit/Credit en format "1234.56"
+    for col in ["Debit", "Credit"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
+
+    # Tout en string (FEC = texte)
+    for c in out.columns:
+        out[c] = out[c].astype(str).replace({"nan": "", "None": ""})
+
+    txt = out.to_csv(
+        index=False,
+        sep="\t",
+        encoding="utf-8-sig",
+        lineterminator="\n"
+    )
+    return txt.encode("utf-8-sig")
 
 def check_balance(fec: pd.DataFrame) -> pd.DataFrame:
     if fec.empty:
@@ -1027,35 +1053,38 @@ else:
 # ============================
 # Downloads
 # ============================
-st.subheader("Téléchargements")
+st.subheader("Téléchargements (.txt tabulation)")
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.download_button(
-        "CSV FEC - Ventes (inclut contrôle)",
-        data=to_csv_bytes(fec_sales, sep=csv_sep),
-        file_name="fec_ventes.csv",
-        mime="text/csv"
+        "FEC Ventes (inclut contrôle) .txt (TAB)",
+        data=to_fec_txt_bytes(fec_sales),
+        file_name="fec_ventes.txt",
+        mime="text/plain"
     )
+
 with col2:
     st.download_button(
-        "CSV FEC - Encaissements",
-        data=to_csv_bytes(fec_sett, sep=csv_sep),
-        file_name="fec_encaissements.csv",
-        mime="text/csv"
+        "FEC Encaissements .txt (TAB)",
+        data=to_fec_txt_bytes(fec_sett),
+        file_name="fec_encaissements.txt",
+        mime="text/plain"
     )
+
 with col3:
     fec_rem_all = pd.concat([fec_rem_cheques, fec_rem_especes], ignore_index=True)
     st.download_button(
-        "CSV FEC - Remises (optionnel)",
-        data=to_csv_bytes(fec_rem_all, sep=csv_sep),
-        file_name="fec_remises.csv",
-        mime="text/csv"
+        "FEC Remises (optionnel) .txt (TAB)",
+        data=to_fec_txt_bytes(fec_rem_all),
+        file_name="fec_remises.txt",
+        mime="text/plain"
     )
+
 with col4:
     st.download_button(
-        "CSV FEC - Global",
-        data=to_csv_bytes(fec_all, sep=csv_sep),
-        file_name="fec_global.csv",
-        mime="text/csv"
+        "FEC Global .txt (TAB)",
+        data=to_fec_txt_bytes(fec_all),
+        file_name="fec_global.txt",
+        mime="text/plain"
     )
