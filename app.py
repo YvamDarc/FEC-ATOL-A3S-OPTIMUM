@@ -23,13 +23,18 @@ FEC_COLUMNS = [
     "Montantdevise", "Idevise"
 ]
 
+# CAISSE exports
 FACTURE_RE = re.compile(r"Facture numéro\s+(\d+)\s+émise le\s+(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
 
-# ⚠️ On NE CHANGE PAS la logique "Remis le" (comme demandé)
+# ⚠️ ON NE CHANGE PAS la logique "Remis le"
 BORDEREAU_RE = re.compile(
     r"Bordereau\s*N°\s*:\s*([A-Za-z0-9\-]+).*?Remis\s+le\s+(\d{2}/\d{2}/\d{4})",
     re.IGNORECASE
 )
+
+# TIERS PAYANT exports
+# On vise le bloc "Tiers-payant encaissés" : header contient ces champs
+TP_HEADER = ["Date pointage", "Date encaissement", "Mode de règlement", "Montant", "N° facture"]
 
 MODE_NORMALIZE = {
     "carte bancaire": "carte bancaire",
@@ -60,7 +65,7 @@ def normalize_mode(x) -> str:
 
 
 def parse_eur(val) -> float:
-    """Parse '156,85€', '13,00€', 13, 13.0."""
+    """Parse '1 420,00€', '156,85€', '13,00€', 13, 13.0 -> float."""
     if val is None:
         return 0.0
     if isinstance(val, (int, float, np.integer, np.floating)):
@@ -72,7 +77,8 @@ def parse_eur(val) -> float:
     if s == "" or s.lower() == "nan":
         return 0.0
 
-    s = s.replace("€", "").replace("\u00a0", " ").strip().replace(" ", "")
+    s = s.replace("€", "").replace("\u00a0", " ").strip()
+    s = s.replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "")
     s = s.replace(",", ".")
@@ -112,38 +118,45 @@ def parse_tva_rate(val) -> float:
     return v / 100.0 if v > 1.0 else v
 
 
+def parse_date_any(x):
+    """Tente de parser une date Excel / string en date()."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return x.date()
+    s = str(x).strip()
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        return pd.to_datetime(s, dayfirst=True, errors="raise").date()
+    except Exception:
+        return None
+
+
 def to_fec_txt_bytes(df: pd.DataFrame) -> bytes:
     """
     Export FEC en .txt séparateur TAB.
-    - séparateur = tabulation
-    - décimales = point (exigé dans beaucoup d'import FEC)
-    - pas d'index
-    - UTF-8 BOM (évite les soucis d'accents dans Excel/logiciels)
+    - décimales = point
+    - UTF-8 BOM
     """
     if df is None or df.empty:
         return "".encode("utf-8-sig")
 
     out = df.copy()
 
-    # Sécuriser les colonnes Debit/Credit en format "1234.56"
     for col in ["Debit", "Credit"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0).map(lambda x: f"{x:.2f}")
 
-    # Tout en string (FEC = texte)
     for c in out.columns:
         out[c] = out[c].astype(str).replace({"nan": "", "None": ""})
 
-    txt = out.to_csv(
-        index=False,
-        sep="\t",
-        encoding="utf-8-sig",
-        lineterminator="\n"
-    )
+    txt = out.to_csv(index=False, sep="\t", encoding="utf-8-sig", lineterminator="\n")
     return txt.encode("utf-8-sig")
 
+
 def check_balance(fec: pd.DataFrame) -> pd.DataFrame:
-    if fec.empty:
+    if fec is None or fec.empty:
         return pd.DataFrame()
     chk = fec.groupby(["JournalCode", "EcritureNum"])[["Debit", "Credit"]].sum()
     chk["Delta"] = (chk["Debit"] - chk["Credit"]).round(2)
@@ -159,15 +172,14 @@ def list_sheets(file_bytes: bytes) -> list[str]:
     return xls.sheet_names
 
 
-def read_sheet_raw(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+def read_sheet_raw(file_bytes: bytes, sheet_name_or_index) -> pd.DataFrame:
     bio = BytesIO(file_bytes)
-    return pd.read_excel(bio, sheet_name=sheet_name, header=None, engine="openpyxl")
+    return pd.read_excel(bio, sheet_name=sheet_name_or_index, header=None, engine="openpyxl")
 
 
 def _norm_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("\u00a0", " ")
-    # rough accent normalization for matching
     s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
     s = s.replace("à", "a").replace("â", "a")
     s = s.replace("î", "i").replace("ï", "i")
@@ -214,7 +226,7 @@ def find_facture_rows(raw: pd.DataFrame) -> list[tuple[int, str, str]]:
 def extract_sales_lines_and_totals(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     - sales_lines: lignes détaillées (produit non vide)
-    - invoice_totals: lignes de synthèse par facture (si présentes)
+    - invoice_totals: ligne de synthèse par facture (si présentes)
       colonnes: invoice_number, invoice_date, total_ttc, total_vat
     """
     factures = find_facture_rows(raw)
@@ -233,7 +245,6 @@ def extract_sales_lines_and_totals(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.
         r1 = factures_with_end[idx + 1][0]
         inv_date = datetime.strptime(date_str, "%d/%m/%Y").date()
 
-        # On exige ces colonnes (ça couvre ton besoin)
         header_row, cols = find_header_row(raw, r0, r1, ["Produits", "TVA", "Total opération", "Montant TVA", "Montant du"])
         if header_row is None:
             continue
@@ -244,7 +255,6 @@ def extract_sales_lines_and_totals(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.
         c_mont_tva = cols[_norm_cell("Montant TVA")]
         c_mont_du = cols[_norm_cell("Montant du")]
 
-        # On prend la dernière "ligne total" rencontrée (souvent en bas)
         last_total = None
 
         for r in range(header_row + 1, r1):
@@ -256,7 +266,7 @@ def extract_sales_lines_and_totals(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.
             montant_tva = parse_eur(raw.iat[r, c_mont_tva])
             total_op = parse_eur(raw.iat[r, c_total_op])
 
-            # Lignes détaillées = produit non vide
+            # Lignes détaillées
             if not prod_is_empty:
                 rate = parse_tva_rate(raw.iat[r, c_tva_rate])
                 if abs(montant_du) > 1e-9:
@@ -269,8 +279,7 @@ def extract_sales_lines_and_totals(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.
                     })
                 continue
 
-            # Ligne non détaillée / synthèse (produit vide) : on essaye de capter un total facture
-            # Cas typique : total_op / montant_tva / montant_du renseignés.
+            # Ligne synthèse / non détaillée
             if abs(montant_du) > 1e-9 and (abs(montant_tva) > 1e-9 or abs(total_op) > 1e-9):
                 last_total = {
                     "invoice_number": str(inv),
@@ -325,7 +334,7 @@ def extract_encaissements(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
-# REMISES file parsing (optional) - ON GARDE LA LOGIQUE "Remis le"
+# REMISES file parsing (optionnel) - ON GARDE LA LOGIQUE "Remis le"
 # ============================
 def extract_remises_cheques(raw: pd.DataFrame) -> pd.DataFrame:
     starts = []
@@ -400,6 +409,53 @@ def extract_remises_especes(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================
+# TIERS PAYANT encaissé parsing (3e fichier)
+# ============================
+def extract_tiers_payant_encaisse(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extrait uniquement le tableau "Tiers-payant encaissés".
+    Critères:
+    - header avec au moins TP_HEADER
+    - Montant > 0
+    - Date encaissement parsable
+    - N° facture non vide
+    """
+    header_row, cols = find_header_row(raw, 0, len(raw), TP_HEADER)
+    if header_row is None:
+        return pd.DataFrame(columns=["invoice", "date_encaissement", "amount", "mode", "source_row"])
+
+    c_date_enc = cols[_norm_cell("Date encaissement")]
+    c_amt = cols[_norm_cell("Montant")]
+    c_inv = cols[_norm_cell("N° facture")]
+    c_mode = cols[_norm_cell("Mode de règlement")]
+
+    rows = []
+    for r in range(header_row + 1, len(raw)):
+        inv = raw.iat[r, c_inv]
+        inv = "" if inv is None else str(inv).strip()
+        if not inv or inv.lower() == "nan":
+            continue
+
+        amt = parse_eur(raw.iat[r, c_amt])
+        if abs(amt) < 0.01:
+            continue
+
+        dt = parse_date_any(raw.iat[r, c_date_enc])
+        if dt is None:
+            continue
+
+        rows.append({
+            "invoice": inv,
+            "date_encaissement": dt,
+            "amount": round(float(amt), 2),
+            "mode": normalize_mode(raw.iat[r, c_mode]),
+            "source_row": r
+        })
+
+    return pd.DataFrame(rows, columns=["invoice", "date_encaissement", "amount", "mode", "source_row"])
+
+
+# ============================
 # Build mappings from CSV text
 # ============================
 def build_vat_map_from_csv(text: str) -> dict:
@@ -448,11 +504,6 @@ def build_mode_map_from_csv(text: str) -> tuple[dict, dict]:
 
 def pick_vat_account_for_control(ttc: float, tva: float, vat_map: dict,
                                  fallback_acc: str, fallback_lib: str) -> tuple[str, str, float]:
-    """
-    On essaye d'inférer le taux = TVA / HT, puis de matcher dans vat_map (tolérance).
-    Sinon, on envoie sur le compte TVA fallback.
-    Retour : (compte_tva, lib_tva, taux_inferé)
-    """
     ht = ttc - tva
     rate = 0.0
     if abs(ht) > 0.009:
@@ -460,16 +511,15 @@ def pick_vat_account_for_control(ttc: float, tva: float, vat_map: dict,
 
     if vat_map:
         candidates = list(vat_map.keys())
-        # plus proche taux
         best = min(candidates, key=lambda x: abs(x - rate))
-        if abs(best - rate) <= 0.002:  # tolérance (0,2 point)
+        if abs(best - rate) <= 0.002:
             return vat_map[best]["vat_acc"], vat_map[best]["vat_lib"], best
 
     return fallback_acc, fallback_lib, rate
 
 
 # ============================
-# Build FEC
+# Build FEC parts
 # ============================
 def build_fec_sales(sales_lines: pd.DataFrame,
                     invoice_totals: pd.DataFrame,
@@ -483,15 +533,9 @@ def build_fec_sales(sales_lines: pd.DataFrame,
                     compte_tva_fallback: str,
                     lib_tva_fallback: str,
                     group_per_invoice_and_rate: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Renvoie:
-    - FEC ventes
-    - liste des factures passées en mode contrôle
-    """
     if sales_lines.empty and invoice_totals.empty:
         return pd.DataFrame(columns=FEC_COLUMNS), pd.DataFrame(columns=["invoice_number", "invoice_date", "reason"])
 
-    # index totals
     totals_idx = {}
     if not invoice_totals.empty:
         for _, r in invoice_totals.iterrows():
@@ -504,7 +548,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
     fec_rows = []
     ctrl_rows = []
 
-    # Liste de factures à traiter = union
     invs = set()
     if not sales_lines.empty:
         invs.update(sales_lines["invoice_number"].astype(str).unique().tolist())
@@ -513,17 +556,14 @@ def build_fec_sales(sales_lines: pd.DataFrame,
     invs = sorted(invs)
 
     for inv in invs:
-        # détail
         df_inv = sales_lines[sales_lines["invoice_number"].astype(str) == str(inv)].copy() if not sales_lines.empty else pd.DataFrame()
         sum_detail = round(float(df_inv["ttc_net"].sum()), 2) if not df_inv.empty else 0.0
 
-        # total facture (si présent)
         has_total = inv in totals_idx
         total_ttc = totals_idx[inv]["total_ttc"] if has_total else None
         total_vat = totals_idx[inv]["total_vat"] if has_total else None
         inv_date = totals_idx[inv]["invoice_date"] if has_total else (df_inv["invoice_date"].iloc[0] if not df_inv.empty else None)
 
-        # Détection incohérence / non détaillé:
         is_ctrl = False
         reason = ""
         if has_total:
@@ -533,7 +573,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
             elif abs(total_ttc - sum_detail) > 0.01:
                 is_ctrl = True
                 reason = f"Total facture ({total_ttc:.2f}) ≠ somme lignes ({sum_detail:.2f})"
-        # Si pas de total, on reste en mode normal (basé sur détails)
 
         if is_ctrl and inv_date is not None:
             ttc = round(float(total_ttc), 2)
@@ -548,7 +587,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
             ecriture_num = f"{inv}-VT-CTRL"
             lib = f"Vente facture {inv} – contrôle (taux≈{inferred_rate*100:.2f}%)"
 
-            # Débit 53 TTC
             fec_rows.append({
                 "JournalCode": journal_code, "JournalLib": journal_lib,
                 "EcritureNum": ecriture_num, "EcritureDate": inv_date.strftime("%Y%m%d"),
@@ -562,7 +600,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
                 "Montantdevise": "", "Idevise": ""
             })
 
-            # Crédit TVA
             if abs(tva) > 0.009:
                 fec_rows.append({
                     "JournalCode": journal_code, "JournalLib": journal_lib,
@@ -577,7 +614,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
                     "Montantdevise": "", "Idevise": ""
                 })
 
-            # Crédit HT -> compte de contrôle
             fec_rows.append({
                 "JournalCode": journal_code, "JournalLib": journal_lib,
                 "EcritureNum": ecriture_num, "EcritureDate": inv_date.strftime("%Y%m%d"),
@@ -594,9 +630,7 @@ def build_fec_sales(sales_lines: pd.DataFrame,
             ctrl_rows.append({"invoice_number": inv, "invoice_date": inv_date, "reason": reason})
             continue
 
-        # ===== Mode normal (détaillé) =====
         if df_inv.empty:
-            # pas de détail + pas de total => rien à faire
             continue
 
         df = df_inv.copy()
@@ -609,7 +643,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
             ttc = round(float(row["ttc_net"]), 2)
 
             if rate not in vat_map:
-                # pas de mapping -> on ignore (mieux: warning dans l'UI)
                 continue
 
             ht = ttc / (1.0 + rate) if (1.0 + rate) != 0 else ttc
@@ -625,7 +658,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
             ecriture_num = f"{inv}-VT"
             lib = f"Vente facture {inv} TVA {rate*100:.2f}%"
 
-            # Débit 53 TTC
             fec_rows.append({
                 "JournalCode": journal_code, "JournalLib": journal_lib,
                 "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -639,7 +671,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
                 "Montantdevise": "", "Idevise": ""
             })
 
-            # Crédit 70 HT
             fec_rows.append({
                 "JournalCode": journal_code, "JournalLib": journal_lib,
                 "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -653,7 +684,6 @@ def build_fec_sales(sales_lines: pd.DataFrame,
                 "Montantdevise": "", "Idevise": ""
             })
 
-            # Crédit TVA
             if abs(tva) > 0.009:
                 fec_rows.append({
                     "JournalCode": journal_code, "JournalLib": journal_lib,
@@ -706,7 +736,6 @@ def build_fec_settlements(enc_df: pd.DataFrame,
         ecriture_num = f"{inv}-ENC"
         lib = f"Encaissement facture {inv} ({mode})"
 
-        # Débit compte règlement
         fec_rows.append({
             "JournalCode": journal_code, "JournalLib": journal_lib,
             "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -720,7 +749,6 @@ def build_fec_settlements(enc_df: pd.DataFrame,
             "Montantdevise": "", "Idevise": ""
         })
 
-        # Crédit 53
         fec_rows.append({
             "JournalCode": journal_code, "JournalLib": journal_lib,
             "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -761,7 +789,6 @@ def build_fec_remises(remises_df: pd.DataFrame,
         ecriture_num = f"{prefix_num}-{bid}"
         lib = f"{lib_prefix} {bid}"
 
-        # Débit (512)
         fec_rows.append({
             "JournalCode": journal_code, "JournalLib": journal_lib,
             "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -775,7 +802,6 @@ def build_fec_remises(remises_df: pd.DataFrame,
             "Montantdevise": "", "Idevise": ""
         })
 
-        # Crédit (5112 ou 531)
         fec_rows.append({
             "JournalCode": journal_code, "JournalLib": journal_lib,
             "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
@@ -795,16 +821,78 @@ def build_fec_remises(remises_df: pd.DataFrame,
     return fec
 
 
-# ============================
-# Streamlit UI
-# ============================
-st.set_page_config(page_title="Optimum → FEC (ventes + encaissements + contrôle)", layout="wide")
-st.title("Export Optimum/AS3 → FEC (Ventes + Encaissements + Mode contrôle factures non détaillées)")
+def build_fec_tiers_payant(tp_df: pd.DataFrame,
+                           journal_code: str,
+                           journal_lib: str,
+                           compte_467: str,
+                           lib_467: str,
+                           compte_584: str,
+                           lib_584: str) -> pd.DataFrame:
+    """
+    Lignes "TP encaissés" :
+      Débit 584 / Crédit 467
+    PieceRef = N° facture (ex: FAC-1000178)
+    EcritureDate = date encaissement
+    """
+    if tp_df is None or tp_df.empty:
+        return pd.DataFrame(columns=FEC_COLUMNS)
 
-st.caption("1) Charge l'export CAISSE (obligatoire). 2) Charge éventuellement un export REMISES (chèques+espèces) séparé.")
+    fec_rows = []
+    for _, r in tp_df.iterrows():
+        inv = str(r["invoice"]).strip()
+        dt = r["date_encaissement"]
+        amt = round(float(r["amount"]), 2)
+
+        ecriture_num = f"{inv}-TP"
+        lib = f"Encaissement tiers payant {inv}"
+
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_584, "CompteLib": lib_584,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": amt, "Credit": 0.0,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+        fec_rows.append({
+            "JournalCode": journal_code, "JournalLib": journal_lib,
+            "EcritureNum": ecriture_num, "EcritureDate": dt.strftime("%Y%m%d"),
+            "CompteNum": compte_467, "CompteLib": lib_467,
+            "CompAuxNum": "", "CompAuxLib": "",
+            "PieceRef": inv, "PieceDate": dt.strftime("%Y%m%d"),
+            "EcritureLib": lib,
+            "Debit": 0.0, "Credit": amt,
+            "EcritureLet": "", "DateLet": "",
+            "ValidDate": dt.strftime("%Y%m%d"),
+            "Montantdevise": "", "Idevise": ""
+        })
+
+    fec = pd.DataFrame(fec_rows, columns=FEC_COLUMNS)
+    for col in ["Debit", "Credit"]:
+        fec[col] = pd.to_numeric(fec[col], errors="coerce").fillna(0.0).round(2)
+    return fec
+
+
+# ============================
+# Streamlit UI (3 fichiers -> 1 FEC)
+# ============================
+st.set_page_config(page_title="Optimum → FEC (3 fichiers)", layout="wide")
+st.title("Optimum/AS3 → FEC unique (CAISSE + REMISES + TIERS PAYANT encaissé)")
+
+st.caption(
+    "1) CAISSE (obligatoire) → ventes + encaissements + contrôle. "
+    "2) REMISES (optionnel) → remises chèques + espèces (logique 'Remis le' inchangée). "
+    "3) TIERS PAYANT (optionnel) → TP encaissés (Débit 584 / Crédit 467)."
+)
 
 uploaded_caisse = st.file_uploader("1) Fichier CAISSE (.xlsx)", type=["xlsx", "xls"], key="caisse")
 uploaded_remises = st.file_uploader("2) Fichier REMISES (.xlsx) — optionnel", type=["xlsx", "xls"], key="remises")
+uploaded_tiers = st.file_uploader("3) Fichier TIERS PAYANT (.xlsx) — optionnel", type=["xlsx", "xls"], key="tiers")
 
 with st.sidebar:
     st.header("Paramètres")
@@ -832,9 +920,6 @@ with st.sidebar:
     group_sales = st.checkbox("Regrouper ventes par facture + taux TVA", value=True)
     group_payments = st.checkbox("Regrouper encaissements par facture + mode", value=True)
 
-    st.subheader("Séparateur export")
-    csv_sep = st.selectbox("Séparateur CSV", options=[";", ",", "\t"], index=0)
-
     st.subheader("Grille TVA → comptes 70 + TVA")
     st.caption("Format CSV (;) : TauxTVA;Compte70;Lib70;CompteTVA;LibTVA")
     vat_default_text = """TauxTVA;Compte70;Lib70;CompteTVA;LibTVA
@@ -856,7 +941,7 @@ tiers-payant;58400000;Tiers payant à recevoir
 """
     mode_text = st.text_area("Grille modes", value=mode_default_text, height=170)
 
-    st.subheader("Paramètres REMISES en banque (si fichier remises fourni)")
+    st.subheader("Paramètres REMISES en banque (si fichier REMISES fourni)")
     jr_code = st.text_input("JournalCode remises", value="BQ")
     jr_lib = st.text_input("JournalLib remises", value="Remises en banque")
 
@@ -869,6 +954,16 @@ tiers-payant;58400000;Tiers payant à recevoir
     compte_531 = st.text_input("Compte 531 (Espèces) - Crédit", value="531000")
     lib_531 = st.text_input("Lib 531", value="Caisse espèces")
 
+    st.subheader("TIERS PAYANT encaissé (467 → 584) si fichier TIERS fourni")
+    jtp_code = st.text_input("JournalCode TP", value="TP")
+    jtp_lib = st.text_input("JournalLib TP", value="Tiers payant")
+
+    compte_467 = st.text_input("Compte 467 (Crédit)", value="467000")
+    lib_467 = st.text_input("Libellé 467", value="Tiers payant à recevoir")
+
+    compte_584 = st.text_input("Compte 584 (Débit)", value="584000")
+    lib_584 = st.text_input("Libellé 584", value="Tiers payant encaissé")
+
 if not uploaded_caisse:
     st.info("Charge au moins le fichier CAISSE.")
     st.stop()
@@ -878,7 +973,6 @@ if not uploaded_caisse:
 # ============================
 file_bytes_caisse = uploaded_caisse.read()
 sheets_caisse = list_sheets(file_bytes_caisse)
-
 sheet_caisse = st.selectbox("Onglet CAISSE à utiliser", sheets_caisse, index=0)
 raw_caisse = read_sheet_raw(file_bytes_caisse, sheet_caisse)
 
@@ -904,7 +998,7 @@ sales_lines, invoice_totals = extract_sales_lines_and_totals(raw_caisse)
 enc = extract_encaissements(raw_caisse)
 
 # ============================
-# Build CAISSE FEC (ventes + contrôle)
+# Build CAISSE FEC
 # ============================
 fec_sales, ctrl_invoices = build_fec_sales(
     sales_lines=sales_lines,
@@ -932,10 +1026,10 @@ fec_sett = build_fec_settlements(
     group_same_mode_per_invoice=group_payments,
 )
 
-fec_all_parts = [fec_sales, fec_sett]
+fec_parts = [fec_sales, fec_sett]
 
 # ============================
-# Optional REMISES file (inchangé)
+# Optional REMISES
 # ============================
 rem_cheques = pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
 rem_especes = pd.DataFrame(columns=["bordereau_id", "remise_date", "total_montant"])
@@ -980,9 +1074,38 @@ if uploaded_remises is not None:
         lib_prefix="Remise espèces bordereau",
     )
 
-    fec_all_parts.extend([fec_rem_cheques, fec_rem_especes])
+    fec_parts.extend([fec_rem_cheques, fec_rem_especes])
 
-fec_all = pd.concat(fec_all_parts, ignore_index=True)
+# ============================
+# Optional TIERS PAYANT (encaissé) -> 467 / 584
+# ============================
+tp_enc = pd.DataFrame(columns=["invoice", "date_encaissement", "amount", "mode", "source_row"])
+fec_tp = pd.DataFrame(columns=FEC_COLUMNS)
+
+if uploaded_tiers is not None:
+    file_bytes_tiers = uploaded_tiers.read()
+    sheets_tiers = list_sheets(file_bytes_tiers)
+    sheet_tiers = st.selectbox("Onglet TIERS PAYANT à utiliser", sheets_tiers, index=0, key="sheet_tiers")
+
+    raw_tiers = read_sheet_raw(file_bytes_tiers, sheet_tiers)
+    tp_enc = extract_tiers_payant_encaisse(raw_tiers)
+
+    fec_tp = build_fec_tiers_payant(
+        tp_df=tp_enc,
+        journal_code=jtp_code,
+        journal_lib=jtp_lib,
+        compte_467=compte_467,
+        lib_467=lib_467,
+        compte_584=compte_584,
+        lib_584=lib_584,
+    )
+
+    fec_parts.append(fec_tp)
+
+# ============================
+# FEC final (unique)
+# ============================
+fec_all = pd.concat(fec_parts, ignore_index=True)
 
 # ============================
 # Warnings mapping
@@ -1002,10 +1125,10 @@ if not enc.empty:
 # ============================
 # Display / metrics
 # ============================
-st.subheader("Synthèse CAISSE")
-c1, c2, c3, c4, c5 = st.columns(5)
+st.subheader("Synthèse")
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1:
-    st.metric("Lignes ventes détaillées", int(len(sales_lines)))
+    st.metric("Lignes ventes", int(len(sales_lines)))
 with c2:
     st.metric("Factures (détail)", int(sales_lines["invoice_number"].nunique()) if not sales_lines.empty else 0)
 with c3:
@@ -1014,16 +1137,18 @@ with c4:
     st.metric("Factures en contrôle", int(len(ctrl_invoices)) if ctrl_invoices is not None else 0)
 with c5:
     st.metric("Lignes encaissements", int(len(enc)))
+with c6:
+    st.metric("TP encaissés", int(len(tp_enc)) if tp_enc is not None else 0)
 
 if ctrl_invoices is not None and not ctrl_invoices.empty:
     st.subheader("Factures en mode contrôle (à vérifier)")
     st.dataframe(ctrl_invoices, use_container_width=True)
 
-st.subheader("Aperçu - Totaux facture détectés")
-st.dataframe(invoice_totals.head(200), use_container_width=True)
-
 st.subheader("Aperçu - Ventes (lignes détaillées)")
 st.dataframe(sales_lines.head(200), use_container_width=True)
+
+st.subheader("Aperçu - Totaux facture détectés")
+st.dataframe(invoice_totals.head(200), use_container_width=True)
 
 st.subheader("Aperçu - Encaissements")
 st.dataframe(enc.head(200), use_container_width=True)
@@ -1035,7 +1160,11 @@ if uploaded_remises is not None:
     st.subheader("Aperçu - Bordereaux espèces")
     st.dataframe(rem_especes, use_container_width=True)
 
-st.subheader("Aperçu FEC - Global")
+if uploaded_tiers is not None:
+    st.subheader("Aperçu - Tiers payant encaissé")
+    st.dataframe(tp_enc, use_container_width=True)
+
+st.subheader("Aperçu FEC - Unique")
 st.dataframe(fec_all.head(300), use_container_width=True)
 
 st.subheader("Contrôles d'équilibre")
@@ -1053,38 +1182,10 @@ else:
 # ============================
 # Downloads
 # ============================
-st.subheader("Téléchargements (.txt tabulation)")
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.download_button(
-        "FEC Ventes (inclut contrôle) .txt (TAB)",
-        data=to_fec_txt_bytes(fec_sales),
-        file_name="fec_ventes.txt",
-        mime="text/plain"
-    )
-
-with col2:
-    st.download_button(
-        "FEC Encaissements .txt (TAB)",
-        data=to_fec_txt_bytes(fec_sett),
-        file_name="fec_encaissements.txt",
-        mime="text/plain"
-    )
-
-with col3:
-    fec_rem_all = pd.concat([fec_rem_cheques, fec_rem_especes], ignore_index=True)
-    st.download_button(
-        "FEC Remises (optionnel) .txt (TAB)",
-        data=to_fec_txt_bytes(fec_rem_all),
-        file_name="fec_remises.txt",
-        mime="text/plain"
-    )
-
-with col4:
-    st.download_button(
-        "FEC Global .txt (TAB)",
-        data=to_fec_txt_bytes(fec_all),
-        file_name="fec_global.txt",
-        mime="text/plain"
-    )
+st.subheader("Téléchargements")
+st.download_button(
+    "FEC global.txt [TAB]",
+    data=to_fec_txt_bytes(fec_all),
+    file_name="fec_global.txt",
+    mime="text/plain"
+)
